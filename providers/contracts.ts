@@ -1,0 +1,65 @@
+import type { AccountRemovalResult } from "../services/account-store";
+import type { ProviderId } from "../models";
+import type { AuthorizationSignal } from "../services/auth-errors";
+import type { NormalizedUsageSnapshot } from "../services/usage-model";
+
+export type ProviderAccount = {
+  id: string;
+  name: string;
+  email: string | null;
+  createdAt: string;
+};
+
+export type ProviderUsageError = {
+  code: string;
+  message: string;
+  status?: number;
+  detail?: string;
+  retryAt?: string;
+};
+
+export type ProviderUsageResult =
+  | {
+      ok: true;
+      snapshot: { source: "live" | "cache" };
+      storageAccepted?: boolean;
+    }
+  | {
+      ok: false;
+      error: ProviderUsageError;
+    };
+
+export type AccountLookupProvider = {
+  id: ProviderId;
+  list(): ProviderAccount[];
+  token(profileId: string): string | null;
+};
+
+export type UsageProvider = AccountLookupProvider & {
+  fetch(options: {
+    force?: boolean;
+    profileId?: string | null;
+  }): Promise<ProviderUsageResult>;
+};
+
+export type ProviderCore = AccountLookupProvider & {
+  ensure(): unknown;
+  create(): ProviderAccount;
+  remove(profileId: string): AccountRemovalResult;
+  auth: {
+    start(profileId: string, input?: string): Promise<string>;
+    complete(input: string, signal?: AuthorizationSignal): Promise<void>;
+    clearPending(): void;
+    pendingId(): string | null;
+    hasPending(): boolean;
+  };
+  usage: {
+    fetch(options: {
+      force?: boolean;
+      profileId?: string | null;
+    }): Promise<ProviderUsageResult>;
+    cache(profileId: string): NormalizedUsageSnapshot | null;
+    clearCache(profileId: string): void;
+  };
+  clearSettings(profileId: string): unknown;
+};

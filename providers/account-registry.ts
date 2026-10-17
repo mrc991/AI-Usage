@@ -1,0 +1,65 @@
+import * as CodexAccounts from "./codex/accounts";
+import * as GrokAccounts from "./grok/accounts";
+import * as ClaudeAccounts from "./claude/accounts";
+import * as AntigravityAccounts from "./antigravity/accounts";
+import * as CursorAccounts from "./cursor/accounts";
+import * as KimiAccounts from "./kimi/accounts";
+import * as CopilotAccounts from "./copilot/accounts";
+import * as ZaiAccounts from "./zai/accounts";
+import * as MinimaxAccounts from "./minimax/accounts";
+import type { ProviderId } from "../models";
+import type { AccountLookupProvider } from "./contracts";
+
+export const ACCOUNT_PROVIDERS = {
+  codex: {
+    id: "codex",
+    list: CodexAccounts.listAccounts,
+    token: CodexAccounts.getProfileAccessToken,
+  },
+  grok: {
+    id: "grok",
+    list: GrokAccounts.listAccounts,
+    token: GrokAccounts.getProfileAccessToken,
+  },
+  claude: {
+    id: "claude",
+    list: ClaudeAccounts.listAccounts,
+    token: ClaudeAccounts.getProfileAccessToken,
+  },
+  antigravity: {
+    id: "antigravity",
+    list: AntigravityAccounts.listAccounts,
+    token: AntigravityAccounts.getProfileAccessToken,
+  },
+  cursor: {
+    id: "cursor",
+    list: CursorAccounts.listAccounts,
+    token: CursorAccounts.getProfileAccessToken,
+  },
+  kimi: {
+    id: "kimi",
+    list: KimiAccounts.listAccounts,
+    token: KimiAccounts.getProfileAccessToken,
+  },
+  copilot: {
+    id: "copilot",
+    list: CopilotAccounts.listAccounts,
+    token: CopilotAccounts.getProfileAccessToken,
+  },
+  zai: {
+    id: "zai",
+    list: ZaiAccounts.listAccounts,
+    token: ZaiAccounts.getProfileAccessToken,
+  },
+  minimax: {
+    id: "minimax",
+    list: MinimaxAccounts.listAccounts,
+    token: MinimaxAccounts.getProfileAccessToken,
+  },
+} satisfies Record<ProviderId, AccountLookupProvider>;
+
+export function getAccountProvider(
+  provider: ProviderId,
+): AccountLookupProvider {
+  return ACCOUNT_PROVIDERS[provider];
+}

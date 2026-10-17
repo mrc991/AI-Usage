@@ -1,0 +1,163 @@
+import type { ProviderId } from "../models";
+import { getAccountProvider } from "../providers/account-registry";
+import { listDemoAccounts } from "./demo";
+
+type Input = {
+  level: "info" | "warning" | "error";
+  source: "app" | "widget" | "intent";
+  category: "auth" | "refresh" | "cache" | "widget" | "settings" | "system";
+  event: string;
+  provider?: ProviderId;
+  accountId?: string | null;
+  message: string;
+  code?: string;
+  status?: number;
+};
+export type RunRecord = {
+  id: string;
+  at: string;
+  kind: "refresh" | "auth" | "refresh_all" | "widget";
+  provider?: ProviderId;
+  accountLabel?: string;
+  status: "success" | "cache" | "warning" | "error";
+  summary: string;
+  detail?: string;
+};
+const KEY = "ai_usage_run_records_v1";
+const MAX = 100;
+const AGE = 7 * 24 * 60 * 60 * 1000;
+function clean(v: unknown, max = 120): string {
+  const s = String(v ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(
+      /([A-Za-z0-9._%+-]{1,2})[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/g,
+      "$1***@$2",
+    )
+    .trim();
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+function sanitizeAccountLabel(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+}
+
+function resolveAccountLabel(
+  provider?: ProviderId,
+  accountId?: string | null,
+): string | undefined {
+  if (!accountId) return undefined;
+  const id = String(accountId).trim();
+  if (!id) return undefined;
+
+  if (provider) {
+    try {
+      const found = getAccountProvider(provider)
+        .list()
+        .find((item) => item.id === id);
+      const label = found?.email || found?.name;
+      if (label) return sanitizeAccountLabel(label);
+    } catch {
+      /* logging must never break app */
+    }
+    try {
+      const demo = listDemoAccounts(provider).find((item) => item.id === id);
+      const label = demo?.email || demo?.name;
+      if (label) return sanitizeAccountLabel(label);
+    } catch {
+      /* logging must never break app */
+    }
+  }
+
+  return id.includes("@") ? sanitizeAccountLabel(id) : undefined;
+}
+function records(): RunRecord[] {
+  try {
+    const value = Storage.get<RunRecord[]>(KEY, { shared: true });
+    return Array.isArray(value)
+      ? value
+          .filter(
+            (item) =>
+              item?.id &&
+              item?.at &&
+              new Date(item.at).getTime() >= Date.now() - AGE,
+          )
+          .slice(-MAX)
+      : [];
+  } catch {
+    return [];
+  }
+}
+function kind(input: Input): RunRecord["kind"] {
+  if (input.event.includes("refresh_all") || input.source === "intent")
+    return "refresh_all";
+  if (input.category === "auth") return "auth";
+  if (input.source === "widget" || input.category === "widget") return "widget";
+  return "refresh";
+}
+function status(input: Input): RunRecord["status"] {
+  if (input.level === "error") return "error";
+  if (input.category === "cache" || input.event.includes("cache"))
+    return "cache";
+  if (input.level === "warning") return "warning";
+  return "success";
+}
+export function writeLog(input: Input, batch?: RunRecord[]): void {
+  const item: RunRecord = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    at: new Date().toISOString(),
+    kind: kind(input),
+    provider: input.provider,
+    accountLabel: resolveAccountLabel(input.provider, input.accountId),
+    status: status(input),
+    summary: clean(input.message),
+    detail:
+      [
+        input.status != null ? `HTTP ${input.status}` : null,
+        input.code ? `代码 ${clean(input.code, 60)}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ") || undefined,
+  };
+  if (batch && input.level === "info") {
+    batch.push(item);
+    if (batch.length >= MAX) flushRunRecordBatch(batch);
+  } else {
+    flushRunRecordBatch([item]);
+  }
+  try {
+    const method =
+      input.level === "error"
+        ? "error"
+        : input.level === "warning"
+          ? "warn"
+          : "log";
+    console[method](`[AI Usage] ${item.summary}`);
+  } catch {
+    /* ignore */
+  }
+}
+export function flushRunRecordBatch(batch: RunRecord[]): void {
+  if (!batch.length) return;
+  const pending = batch.splice(0);
+  try {
+    Storage.set(
+      KEY,
+      [...records(), ...pending]
+        .sort((a, b) => a.at.localeCompare(b.at))
+        .slice(-MAX),
+      { shared: true },
+    );
+  } catch {
+    /* logging must not break refresh */
+  }
+}
+export function readRunRecords(): RunRecord[] {
+  return records().reverse();
+}
+export function clearRunRecords(): void {
+  try {
+    Storage.remove(KEY, { shared: true });
+  } catch {
+    /* ignore */
+  }
+}

@@ -1,0 +1,483 @@
+import {
+  AuthorizationCheckDeferred,
+  checkAuthorizationOnce,
+} from "../../services/auth-single-check";
+import { captureAccountWork } from "../../services/account-work-guard";
+import { createAccountOperationFlight } from "../../services/runtime-consistency";
+import { activePendingAuthorization } from "../../services/oauth-pending";
+import { CredentialPersistenceError } from "../../services/credential-errors";
+import {
+  createAuthorizationGuard,
+  throwIfAuthorizationCancelled,
+  type AuthorizationSignal,
+} from "../../services/auth-errors";
+import { fetch, Response } from "scripting";
+import { parseJwtPayload } from "../../services/jwt-payload";
+import {
+  getProfileAccessToken,
+  getProfileRefreshToken,
+  getProfileTokenExpiresAt,
+  saveProfileCredentials,
+} from "./accounts";
+
+const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
+const CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll";
+const CURSOR_REFRESH_URL = "https://api2.cursor.sh/auth/exchange_user_api_key";
+const PENDING_KEY = "ai_usage_cursor_oauth_pending_v1";
+const PENDING_TTL_MS = 10 * 60_000;
+const EXPIRY_SKEW_MS = 5 * 60_000;
+const FALLBACK_TTL_MS = 60 * 60_000;
+
+type PendingOAuth = {
+  uuid: string;
+  verifier: string;
+  createdAt: number;
+  profileId: string;
+};
+
+type TokenPayload = {
+  accessToken?: string;
+  refreshToken?: string;
+};
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function base64Url(data: Data): string {
+  return data
+    .toBase64String()
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function randomUrlSafe(): string {
+  return base64Url(Crypto.generateSymmetricKey(256));
+}
+
+function createPkce(): { verifier: string; challenge: string } {
+  const verifier = randomUrlSafe();
+  const bytes = Data.fromRawString(verifier, "utf-8");
+  if (!bytes) throw new Error("无法生成 PKCE 数据");
+  return { verifier, challenge: base64Url(Crypto.sha256(bytes)) };
+}
+
+function createUuid(): string {
+  const raw = base64Url(Crypto.generateSymmetricKey(192))
+    .replace(/[^a-zA-Z0-9]/g, "")
+    .padEnd(32, "0")
+    .slice(0, 32)
+    .toLowerCase();
+  return `${raw.slice(0, 8)}-${raw.slice(8, 12)}-4${raw.slice(13, 16)}-${raw.slice(16, 20)}-${raw.slice(20, 32)}`;
+}
+
+function savePending(value: PendingOAuth): void {
+  if (!Keychain.set(PENDING_KEY, JSON.stringify(value)))
+    throw new Error("无法保存临时 OAuth 状态");
+}
+
+function readPending(): PendingOAuth | null {
+  try {
+    const raw = Keychain.get(PENDING_KEY);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<PendingOAuth>;
+    if (!value.uuid || !value.verifier || !value.createdAt || !value.profileId)
+      return null;
+    return value as PendingOAuth;
+  } catch {
+    return null;
+  }
+}
+
+function clearPending(): void {
+  try {
+    Keychain.remove(PENDING_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function tokenExpiry(token: string): number {
+  const payload = parseJwtPayload(token);
+  const exp = payload?.exp;
+  if (typeof exp === "number" && Number.isFinite(exp))
+    return exp * 1000 - EXPIRY_SKEW_MS;
+  return Date.now() + FALLBACK_TTL_MS;
+}
+
+function emailFromObject(value: Record<string, unknown> | null): string | null {
+  if (!value) return null;
+  for (const key of [
+    "email",
+    "userEmail",
+    "user_email",
+    "preferred_username",
+    "upn",
+    "unique_name",
+  ]) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.includes("@"))
+      return candidate.trim();
+  }
+  const customer = asObject(value.customer);
+  if (customer) {
+    const nested = emailFromObject(customer);
+    if (nested) return nested;
+  }
+  const user = asObject(value.user);
+  if (user) {
+    const nested = emailFromObject(user);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function accountIdFromObject(
+  value: Record<string, unknown> | null,
+): string | null {
+  if (!value) return null;
+  for (const key of [
+    "sub",
+    "userId",
+    "user_id",
+    "id",
+    "accountId",
+    "account_id",
+  ]) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim())
+      return candidate.trim();
+    if (typeof candidate === "number" && Number.isSafeInteger(candidate))
+      return String(candidate);
+  }
+  return null;
+}
+
+async function fetchEmailFromStripeProfile(
+  token: string,
+): Promise<string | null> {
+  try {
+    const response = await fetch(
+      "https://api2.cursor.sh/auth/full_stripe_profile",
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+        },
+        timeout: 15,
+        debugLabel: "CursorStripeProfile",
+      },
+    );
+    if (!response.ok) return null;
+    return emailFromObject(await jsonObject(response));
+  } catch {
+    return null;
+  }
+}
+
+/** 从 JWT sub 解析网页会话用的 userId（auth0|xxx → xxx）。 */
+function sessionUserIdFromToken(token: string): string | null {
+  const payload = parseJwtPayload(token);
+  const sub = payload?.sub;
+  if (typeof sub !== "string" || !sub.trim()) return null;
+  const parts = sub.split("|");
+  const userId = (parts.length > 1 ? parts[parts.length - 1] : sub).trim();
+  return userId || null;
+}
+
+/**
+ * 官方网页身份接口：GET https://cursor.com/api/auth/me
+ * 使用 WorkosCursorSessionToken=userId::accessToken Cookie（与 Dashboard 一致）。
+ */
+async function fetchIdentityFromAuthMe(
+  token: string,
+): Promise<{ email: string | null; accountId: string | null }> {
+  const jwt = parseJwtPayload(token);
+  const userId = sessionUserIdFromToken(token);
+  const jwtSub =
+    typeof jwt?.sub === "string" && jwt.sub.trim() ? jwt.sub.trim() : null;
+  const attempts: Array<Record<string, string>> = [];
+  if (userId) {
+    attempts.push({
+      Accept: "application/json",
+      Cookie: `WorkosCursorSessionToken=${encodeURIComponent(`${userId}::${token}`)}`,
+    });
+  }
+  attempts.push({
+    Accept: "application/json",
+    Authorization: `Bearer ${token}`,
+  });
+
+  for (const headers of attempts) {
+    try {
+      const response = await fetch("https://cursor.com/api/auth/me", {
+        method: "GET",
+        headers,
+        timeout: 15,
+        debugLabel: "CursorAuthMe",
+      });
+      if (!response.ok) continue;
+      const payload = await jsonObject(response);
+      if (typeof payload.sub === "string" && payload.sub.trim()) {
+        const meSub = payload.sub.trim();
+        if (userId && meSub !== userId && jwtSub && meSub !== jwtSub) {
+          continue;
+        }
+      }
+      const email = emailFromObject(payload);
+      const accountId =
+        (typeof payload.sub === "string" && payload.sub.trim()
+          ? payload.sub.trim()
+          : null) || accountIdFromObject(payload);
+      if (email || accountId) return { email, accountId };
+    } catch {
+      /* try next */
+    }
+  }
+  return { email: null, accountId: null };
+}
+
+async function resolveIdentity(
+  token: string,
+  extra?: Record<string, unknown> | null,
+): Promise<{ email: string | null; accountId: string | null }> {
+  const jwt = parseJwtPayload(token);
+  let email = emailFromObject(jwt) || emailFromObject(extra || null) || null;
+  let accountId =
+    accountIdFromObject(jwt) || accountIdFromObject(extra || null);
+
+  // 优先走官方网页身份接口拿邮箱。
+  if (!email) {
+    const fromMe = await fetchIdentityFromAuthMe(token);
+    email = fromMe.email;
+    accountId = accountId || fromMe.accountId;
+  }
+
+  // 回退 Stripe profile（IDE 订阅页同源）。
+  if (!email) email = await fetchEmailFromStripeProfile(token);
+  return { email, accountId };
+}
+
+async function jsonObject(
+  response: Response,
+): Promise<Record<string, unknown>> {
+  const text = await response.text();
+  try {
+    return asObject(JSON.parse(text)) || {};
+  } catch {
+    throw new Error(`OAuth 响应异常（HTTP ${response.status}）`);
+  }
+}
+
+async function pollForTokens(
+  uuid: string,
+  verifier: string,
+  createdAt: number,
+  signal?: AuthorizationSignal,
+): Promise<TokenPayload & Record<string, unknown>> {
+  if (Date.now() - createdAt > PENDING_TTL_MS)
+    throw new Error("Cursor 授权已过期，请重新授权");
+  return checkAuthorizationOnce(async (checkSignal) => {
+    const response = await fetch(
+      `${CURSOR_POLL_URL}?uuid=${encodeURIComponent(uuid)}&verifier=${encodeURIComponent(verifier)}`,
+      { timeout: 5, debugLabel: "CursorAuthPoll" },
+    );
+    throwIfAuthorizationCancelled(checkSignal);
+    if (response.status === 404) throw new AuthorizationCheckDeferred();
+    if (response.ok) {
+      const data = await jsonObject(response);
+      throwIfAuthorizationCancelled(checkSignal);
+      if (!data.accessToken || !data.refreshToken)
+        throw new Error("Cursor 授权响应缺少 Token");
+      return data as TokenPayload & Record<string, unknown>;
+    }
+    if ([400, 401, 403, 410].includes(response.status))
+      throw new Error("Cursor 授权已失效或被拒绝，请重新授权");
+    throw new AuthorizationCheckDeferred(
+      "暂时无法确认授权结果，请稍后继续授权",
+    );
+  }, signal).catch((error) => {
+    if (
+      error instanceof AuthorizationCheckDeferred ||
+      (error instanceof Error &&
+        error.name === "AuthorizationCancelledError") ||
+      (error instanceof Error &&
+        (error.message.includes("失效") || error.message.includes("缺少")))
+    )
+      throw error;
+    throw new AuthorizationCheckDeferred(
+      "暂时无法确认授权结果，请稍后继续授权",
+    );
+  });
+}
+
+export function hasPendingOAuth(): boolean {
+  return Boolean(
+    activePendingAuthorization(readPending(), PENDING_TTL_MS, clearPending),
+  );
+}
+
+export function getPendingOAuthProfileId(): string | null {
+  return (
+    activePendingAuthorization(readPending(), PENDING_TTL_MS, clearPending)
+      ?.profileId || null
+  );
+}
+
+export function clearPendingOAuth(): void {
+  clearPending();
+}
+
+export async function startCursorLogin(profileId: string): Promise<string> {
+  if (!profileId) throw new Error("未指定要授权的账号");
+  const pkce = createPkce();
+  const uuid = createUuid();
+  savePending({
+    uuid,
+    verifier: pkce.verifier,
+    createdAt: Date.now(),
+    profileId,
+  });
+  const params = [
+    ["challenge", pkce.challenge],
+    ["uuid", uuid],
+    ["mode", "login"],
+    ["redirectTarget", "cli"],
+  ]
+    .map(
+      ([key, value]) =>
+        `${encodeURIComponent(key)}=${encodeURIComponent(value)}`,
+    )
+    .join("&");
+  return `${CURSOR_LOGIN_URL}?${params}`;
+}
+
+export async function completeCursorLogin(
+  _input?: string,
+  signal?: AuthorizationSignal,
+): Promise<void> {
+  throwIfAuthorizationCancelled(signal);
+  const pending = readPending();
+  if (!pending) throw new Error("未找到待完成的 Cursor 授权，请重新开始");
+  const assertCurrent = createAuthorizationGuard(pending, readPending, signal);
+  if (Date.now() - pending.createdAt > PENDING_TTL_MS) {
+    clearPending();
+    throw new Error("OAuth 会话已超过 10 分钟，请重新授权");
+  }
+  try {
+    const tokens = await pollForTokens(
+      pending.uuid,
+      pending.verifier,
+      pending.createdAt,
+      signal,
+    );
+    throwIfAuthorizationCancelled(signal);
+    assertCurrent();
+    const identity = await resolveIdentity(tokens.accessToken!, tokens);
+    assertCurrent();
+    const saved = saveProfileCredentials(pending.profileId, {
+      accessToken: tokens.accessToken!,
+      refreshToken: tokens.refreshToken,
+      expiresAt: tokenExpiry(tokens.accessToken!),
+      accountId: identity.accountId,
+      email: identity.email,
+    });
+    if (!saved) throw new Error("Token 已获取，但本机 Keychain 保存失败");
+    clearPending();
+  } catch (error) {
+    assertCurrent();
+    if (error instanceof AuthorizationCheckDeferred) throw error;
+    clearPending();
+    throw error;
+  }
+}
+
+/** 在缺少邮箱时回填账号显示名（JWT → auth/me → Stripe profile）。 */
+export async function ensureAccountEmail(
+  profileId: string,
+  token?: string | null,
+): Promise<string | null> {
+  const accessToken = token || getProfileAccessToken(profileId);
+  if (!accessToken) return null;
+  const identity = await resolveIdentity(accessToken);
+  // 只有拿到邮箱才回写，避免仅有 accountId 时把展示名写成 acct_ id。
+  if (!identity.email) return null;
+  const saved = saveProfileCredentials(profileId, {
+    accessToken,
+    accountId: identity.accountId,
+    email: identity.email,
+  });
+  return saved ? identity.email : null;
+}
+
+const renewAccount = createAccountOperationFlight<{
+  token: string | null;
+  forced: boolean;
+}>();
+export async function refreshOAuthToken(
+  profileId: string,
+  force = false,
+): Promise<string | null> {
+  const before = getProfileAccessToken(profileId);
+  const execute = () =>
+    renewAccount(profileId, async () => ({
+      token: await performTokenRefresh(profileId, force),
+      forced: force,
+    }));
+  const result = await execute();
+  return force && !result.forced && result.token === before
+    ? (await execute()).token
+    : result.token;
+}
+async function performTokenRefresh(
+  profileId: string,
+  force = false,
+): Promise<string | null> {
+  const currentWork = captureAccountWork("cursor", profileId);
+  const current = getProfileAccessToken(profileId);
+  const expiresAt = getProfileTokenExpiresAt(profileId);
+  if (!force && current && (!expiresAt || expiresAt > Date.now() + 2 * 60_000))
+    return current;
+  const refreshToken = getProfileRefreshToken(profileId);
+  if (!refreshToken) return current;
+  // 网络失败时回退当前 token，不向调用方抛异常（widget 等无防护上下文中尤为重要）
+  let data: Record<string, unknown>;
+  try {
+    const response = await fetch(CURSOR_REFRESH_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${refreshToken}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: "{}",
+      timeout: 20,
+      debugLabel: "CursorTokenRefresh",
+    });
+    data = await jsonObject(response);
+    if (!response.ok || typeof data.accessToken !== "string") return current;
+  } catch {
+    return current;
+  }
+  const identity = await resolveIdentity(data.accessToken, data);
+  if (
+    !currentWork() ||
+    getProfileAccessToken(profileId) !== current ||
+    getProfileRefreshToken(profileId) !== refreshToken
+  )
+    return getProfileAccessToken(profileId);
+  const saved = saveProfileCredentials(profileId, {
+    accessToken: data.accessToken,
+    refreshToken:
+      typeof data.refreshToken === "string" ? data.refreshToken : refreshToken,
+    expiresAt: tokenExpiry(data.accessToken),
+    accountId: identity.accountId,
+    email: identity.email,
+  });
+  if (!saved) throw new CredentialPersistenceError();
+  return data.accessToken;
+}
