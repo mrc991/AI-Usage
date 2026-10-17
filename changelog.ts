@@ -6,6 +6,13 @@ export type ChangelogEntry = {
 
 export const CHANGELOG = [
   {
+    version: "1.8.2",
+    date: "2026-10-17",
+    changes: [
+      "Antigravity 账号详情页新增“查看接口诊断（Argon）”，可查看并复制最近一次刷新时接口返回的额度桶和模型 ID（不含令牌和邮箱），用于排查 Gemini 4 Argon 没显示的问题。",
+    ],
+  },
+  {
     version: "1.8.1",
     date: "2026-10-17",
     changes: [

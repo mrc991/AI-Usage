@@ -8,6 +8,8 @@ https://raw.githubusercontent.com/mrc991/AI-Usage/main/AI-Usage.scripting
 
 本仓库基于 [StarYunLee/Scripting](https://github.com/StarYunLee/Scripting/tree/main/AI%20Usage) 的 AI Usage 1.8.0。1.8.1 只补充 Antigravity 中 Gemini 4 Argon 的独立周额度；没有该额度的账号不会多出空行，其余平台不变。
 
+1.8.2 在 Antigravity 账号详情页增加“查看接口诊断（Argon）”，显示最近一次刷新时接口返回的额度桶和模型 ID（不含令牌和邮箱），用于排查 Argon 没显示的问题。
+
 <table>
   <tr>
     <td align="center" width="25%"><img src="assets/ai-usage-preview-app-light.jpeg" alt="AI Usage 浅色应用预览" /></td>
@@ -31,7 +33,7 @@ https://raw.githubusercontent.com/mrc991/AI-Usage/main/AI-Usage.scripting
 
 面向 [Scripting App](https://scriptingapp.github.io/) 的非官方多平台用量查看应用。在一个项目里管理 Codex、Grok、Claude、Antigravity、Cursor、Kimi Code、GitHub Copilot、Z.ai 与 MiniMax 的多账号用量、主屏幕小组件和自动化刷新。
 
-当前版本：`1.8.0`
+当前版本：`1.8.2`
 
 > 本项目不是 OpenAI、xAI、Anthropic、Google 或 Scripting App 官方产品，与上述平台无隶属或合作关系。
 

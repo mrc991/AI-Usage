@@ -13,6 +13,11 @@ import {
   updateProfileInfo,
 } from "./accounts";
 import { shouldStopCodeAssistHostLoop } from "./host-failover";
+import {
+  describeAvailableModels,
+  describeQuotaSummary,
+  saveDiagnostics,
+} from "./diagnostics";
 import { fetchAccountInfo, refreshOAuthToken } from "./oauth";
 import {
   asObject,
@@ -150,7 +155,19 @@ async function fetchQuotaWindows(
   token: string,
   projectId: string | null,
   budget: RequestBudget,
+  profileId: string,
 ): Promise<LimitWindow[]> {
+  // 诊断信息只含额度结构（桶/模型 ID），用于排查 Argon 为何没显示。
+  const diag: string[] = [];
+  const finish = (windows: LimitWindow[]): LimitWindow[] => {
+    diag.push(
+      `[解析结果] ${windows.length ? windows.map((w) => `${w.label}(${w.source})`).join("；") : "无窗口"}`,
+      `[解析结果] 含 Argon: ${windows.some(isArgonWindow) ? "是" : "否"}`,
+    );
+    saveDiagnostics(profileId, diag);
+    return windows;
+  };
+
   let summaryWindows: LimitWindow[] = [];
   try {
     const summary = await postQuota(
@@ -159,27 +176,40 @@ async function fetchQuotaWindows(
       projectId,
       budget,
     );
+    diag.push(...describeQuotaSummary(summary));
     summaryWindows = parseQuotaSummary(summary);
   } catch (error) {
     const status = (error as UpstreamError).status;
-    if (status === 401 || status === 403 || status === 429) throw error;
+    diag.push(
+      `[额度摘要] 请求失败 HTTP ${status ?? "无"}: ${error instanceof Error ? error.message : "未知错误"}`,
+    );
+    if (status === 401 || status === 403 || status === 429) {
+      saveDiagnostics(profileId, diag);
+      throw error;
+    }
   }
-  if (summaryWindows.some(isArgonWindow)) return summaryWindows;
+  if (summaryWindows.some(isArgonWindow)) return finish(summaryWindows);
 
   let modelWindows: LimitWindow[] = [];
   try {
-    modelWindows = parseAvailableModels(
-      await postQuota(token, MODELS_PATH, projectId, budget),
-    );
+    const models = await postQuota(token, MODELS_PATH, projectId, budget);
+    diag.push(...describeAvailableModels(models));
+    modelWindows = parseAvailableModels(models);
   } catch (error) {
-    if (summaryWindows.length) return summaryWindows;
+    diag.push(
+      `[模型列表] 请求失败 HTTP ${(error as UpstreamError).status ?? "无"}: ${error instanceof Error ? error.message : "未知错误"}`,
+    );
+    if (summaryWindows.length) return finish(summaryWindows);
+    saveDiagnostics(profileId, diag);
     throw error;
   }
-  if (!summaryWindows.length) return modelWindows;
+  if (!summaryWindows.length) return finish(modelWindows);
   const argonWindows = modelWindows.filter(isArgonWindow);
-  return argonWindows.length
-    ? [...summaryWindows, ...argonWindows].sort(sortWindows)
-    : summaryWindows;
+  return finish(
+    argonWindows.length
+      ? [...summaryWindows, ...argonWindows].sort(sortWindows)
+      : summaryWindows,
+  );
 }
 
 function shouldRefreshAccountInfo(planLabel: string | null): boolean {
@@ -201,7 +231,7 @@ async function fetchLive(
     : Promise.resolve(null);
   const [info, windows] = await Promise.all([
     accountInfo,
-    fetchQuotaWindows(token, profile.projectId, budget),
+    fetchQuotaWindows(token, profile.projectId, budget, profileId),
   ]);
   const projectId = info?.projectId || profile.projectId;
   const planLabel = info?.planLabel || profile.planLabel;

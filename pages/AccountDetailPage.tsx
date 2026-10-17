@@ -14,6 +14,7 @@ import {
   useState,
 } from "scripting";
 import { providerMeta, type ProviderId } from "../models";
+import { readDiagnostics } from "../providers/antigravity/diagnostics";
 import { widgetParameter } from "../widget/parameter";
 import { PageBackground } from "../components/PageBackground";
 import { PlanBadge } from "../components/PlanBadge";
@@ -117,6 +118,25 @@ export function AccountDetailPage(props: {
         buttonLabel: "关闭",
       });
     }
+  }
+
+  async function showAntigravityDiagnostics() {
+    const diag = readDiagnostics(props.account.id);
+    if (!diag) {
+      await Dialog.alert({
+        title: "接口诊断",
+        message: "还没有诊断数据。请先回到用量页刷新一次该账号，再回来查看。",
+        buttonLabel: "关闭",
+      });
+      return;
+    }
+    const text = `获取时间: ${diag.fetchedAt}\n${diag.lines.join("\n")}`;
+    await Pasteboard.setString(text);
+    await Dialog.alert({
+      title: "接口诊断（已复制到剪贴板）",
+      message: text,
+      buttonLabel: "关闭",
+    });
   }
 
   async function confirmDelete() {
@@ -387,6 +407,22 @@ export function AccountDetailPage(props: {
             </Button>
             <GlassDivider />
             <GlassNoteRow text="复制后长按主屏幕小组件，在“编辑小组件”中粘贴到“参数”。" />
+          </GlassGroup>
+        </Section>
+      ) : null}
+
+      {props.provider === "antigravity" && !props.demo ? (
+        <Section
+          listRowBackground={glassRowBackground}
+          header={<GlassSectionHeader title="诊断" />}
+        >
+          <GlassGroup>
+            <DetailActionRow
+              title="查看接口诊断（Argon）"
+              action={showAntigravityDiagnostics}
+            />
+            <GlassDivider />
+            <GlassNoteRow text="显示最近一次刷新时接口返回的额度桶和模型 ID，不含令牌和邮箱，并自动复制到剪贴板。" />
           </GlassGroup>
         </Section>
       ) : null}
