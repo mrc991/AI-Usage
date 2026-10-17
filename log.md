@@ -7,3 +7,5 @@
 - 验证命令及结果：`node 8.tmpfile/20261017-ai-usage/check-argon.mjs`，结果 PASS。覆盖了独立 Argon 周额度、`gemini-argon-*` 不再并进 Gemini、无 Argon 账号仍是原来的四条额度、模型列表里的 Argon 档位合并成一条周额度。项目本身没有测试脚本。
 - 是否已推送远端：本条记录写入时尚未推送；推送结果追加在下方。
 - 跨仓库联动影响：无
+
+推送结果：已推送到 `origin/main`（`54e17e1`，仓库 https://github.com/mrc991/AI-Usage ）。GitHub push protection 拦截了上游脚本自带的 Google 桌面 OAuth client，已按 false positive 放行后推送成功。订阅地址：https://raw.githubusercontent.com/mrc991/AI-Usage/main/AI-Usage.scripting
